@@ -264,6 +264,8 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         //
         // We only add these clauses for packages that can actually be selected to
         // reduce the overall number of clauses.
+        
+        // Group candidates by name and merge directly into pending_forbid_clauses
         for (solvable, variable_id) in candidates
             .iter()
             .zip(version_set_variables.iter())
@@ -292,19 +294,23 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
         let mut conditions = Vec::with_capacity(condition.as_ref().map_or(0, |(_, dnf)| dnf.len()));
         if let Some((condition, dnf)) = condition {
             for disjunctions in dnf {
-                let mut disjunction_literals = Vec::new();
+                let mut disjunction_literals = Vec::with_capacity(disjunctions.len());
                 for disjunction_complement in disjunctions {
                     match disjunction_complement {
                         DisjunctionComplement::Solvables(version_set, solvables) => {
                             let name_id = self.cache.provider().version_set_name(version_set);
-                            let pending_forbid_clauses =
-                                self.pending_forbid_clauses.entry(name_id).or_default();
                             disjunction_literals.reserve(solvables.len());
-                            pending_forbid_clauses.reserve(solvables.len());
+                            
+                            // Get or create the forbid clauses list once
+                            let forbid_list = self.pending_forbid_clauses
+                                .entry(name_id)
+                                .or_default();
+                            
+                            // Process solvables directly without intermediate allocation
                             for &solvable in solvables {
                                 let variable = self.state.variable_map.intern_solvable(solvable);
                                 disjunction_literals.push(variable.positive());
-                                pending_forbid_clauses.push(variable);
+                                forbid_list.push(variable);
                             }
                         }
                         DisjunctionComplement::Empty(version_set) => {
@@ -367,7 +373,7 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
             self.state
                 .requires_clauses
                 .entry(variable)
-                .or_default()
+                .or_insert_with(Vec::new)
                 .push((requirement.requirement, condition, clause_id));
 
             if conflict {
@@ -623,81 +629,77 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
     /// clauses for the packages that are reachable from a requirement as an
     /// optimization.
     fn add_pending_forbid_clauses(&mut self) {
-        for (name_id, candidate_var) in
-            self.pending_forbid_clauses
-                .drain(..)
-                .flat_map(|(name_id, candidate_vars)| {
-                    candidate_vars
-                        .into_iter()
-                        .map(move |candidate_var| (name_id, candidate_var))
-                })
-        {
-            // Add forbid constraints for this solvable on all other
-            // solvables that have been visited already for the same
-            // version set name.
+        // Process all pending forbid clauses using drain for better performance
+        let pending = std::mem::take(&mut self.pending_forbid_clauses);
+        for (name_id, candidate_vars) in pending {
+            // Get or create the at_most_one_tracker for this package
             let other_solvables = self.state.at_most_one_trackers.entry(name_id).or_default();
-            let variable_is_new = other_solvables.add(
-                candidate_var,
-                |a, b, positive| {
-                    let literal_b = if positive { b.positive() } else { b.negative() };
-                    let literal_a = a.negative();
-                    let (watched_literals, kind) =
-                        WatchedLiterals::forbid_multiple(a, literal_b, name_id);
-                    let clause_id = self.state.clauses.alloc(watched_literals, kind);
-                    let watched_literals = self.state.clauses.watched_literals
-                        [clause_id.to_usize()]
-                    .as_mut()
-                    .expect("forbid clause must have watched literals");
-                    self.state
-                        .watches
-                        .start_watching(watched_literals, clause_id);
-
-                    // Add a decision if a decision has already been made for one of the literals.
-                    let set_literal = match (
-                        literal_a.eval(self.state.decision_tracker.map()),
-                        literal_b.eval(self.state.decision_tracker.map()),
-                    ) {
-                        (Some(false), None) => Some(literal_b),
-                        (None, Some(false)) => Some(literal_a),
-                        (Some(false), Some(false)) => unreachable!(
-                            "both literals cannot be false as that would be a conflict"
-                        ),
-                        _ => None,
-                    };
-                    if let Some(literal) = set_literal {
+            
+            // Process each candidate variable for this package
+            for candidate_var in candidate_vars {
+                let variable_is_new = other_solvables.add(
+                    candidate_var,
+                    |a, b, positive| {
+                        let literal_b = if positive { b.positive() } else { b.negative() };
+                        let literal_a = a.negative();
+                        let (watched_literals, kind) =
+                            WatchedLiterals::forbid_multiple(a, literal_b, name_id);
+                        let clause_id = self.state.clauses.alloc(watched_literals, kind);
+                        let watched_literals = self.state.clauses.watched_literals
+                            [clause_id.to_usize()]
+                        .as_mut()
+                        .expect("forbid clause must have watched literals");
                         self.state
-                            .decision_tracker
-                            .try_add_decision(
-                                Decision::new(
-                                    literal.variable(),
-                                    literal.satisfying_value(),
-                                    clause_id,
-                                ),
-                                self.level,
-                            )
-                            .expect("we checked that there is no value yet");
-                    }
-                },
-                || {
-                    self.state
-                        .variable_map
-                        .alloc_forbid_multiple_variable(name_id)
-                },
-            );
+                            .watches
+                            .start_watching(watched_literals, clause_id);
 
-            if variable_is_new {
-                if let Some(&at_least_one_variable) = self.state.at_least_one_tracker.get(&name_id)
-                {
-                    let (watched_literals, kind) =
-                        WatchedLiterals::any_of(at_least_one_variable, candidate_var);
-                    let clause_id = self.state.clauses.alloc(watched_literals, kind);
-                    let watched_literals = self.state.clauses.watched_literals
-                        [clause_id.to_usize()]
-                    .as_mut()
-                    .expect("forbid clause must have watched literals");
-                    self.state
-                        .watches
-                        .start_watching(watched_literals, clause_id);
+                        // Add a decision if a decision has already been made for one of the literals.
+                        let set_literal = match (
+                            literal_a.eval(self.state.decision_tracker.map()),
+                            literal_b.eval(self.state.decision_tracker.map()),
+                        ) {
+                            (Some(false), None) => Some(literal_b),
+                            (None, Some(false)) => Some(literal_a),
+                            (Some(false), Some(false)) => unreachable!(
+                                "both literals cannot be false as that would be a conflict"
+                            ),
+                            _ => None,
+                        };
+                        if let Some(literal) = set_literal {
+                            self.state
+                                .decision_tracker
+                                .try_add_decision(
+                                    Decision::new(
+                                        literal.variable(),
+                                        literal.satisfying_value(),
+                                        clause_id,
+                                    ),
+                                    self.level,
+                                )
+                                .expect("we checked that there is no value yet");
+                        }
+                    },
+                    || {
+                        self.state
+                            .variable_map
+                            .alloc_forbid_multiple_variable(name_id)
+                    },
+                );
+
+                if variable_is_new {
+                    if let Some(&at_least_one_variable) = self.state.at_least_one_tracker.get(&name_id)
+                    {
+                        let (watched_literals, kind) =
+                            WatchedLiterals::any_of(at_least_one_variable, candidate_var);
+                        let clause_id = self.state.clauses.alloc(watched_literals, kind);
+                        let watched_literals = self.state.clauses.watched_literals
+                            [clause_id.to_usize()]
+                        .as_mut()
+                        .expect("forbid clause must have watched literals");
+                        self.state
+                            .watches
+                            .start_watching(watched_literals, clause_id);
+                    }
                 }
             }
         }
@@ -719,36 +721,33 @@ impl<'a, 'cache, D: DependencyProvider> Encoder<'a, 'cache, D> {
     ///
     /// See [`super::conditions`] for more information about conditions.
     fn add_pending_at_least_one_clauses(&mut self) {
-        for (name_id, at_least_one_variable) in self.new_at_least_one_packages.drain(..) {
-            // Find the at-most-one tracker for the package. We want to reuse the same
-            // variables.
-            let variables = self
-                .state
-                .at_most_one_trackers
-                .get(&name_id)
-                .map(|tracker| &tracker.variables);
-
-            // Add clauses for the existing variables.
-            for &helper_var in variables.into_iter().flatten() {
-                let (watched_literals, kind) =
-                    WatchedLiterals::any_of(at_least_one_variable, helper_var);
-                let clause_id = self.state.clauses.alloc(watched_literals, kind);
-                let watched_literals = self.state.clauses.watched_literals[clause_id.to_usize()]
-                    .as_mut()
-                    .expect("forbid clause must have watched literals");
-                self.state
-                    .watches
-                    .start_watching(watched_literals, clause_id);
-
-                // Assign true if any of the variables is true.
-                if self.state.decision_tracker.assigned_value(helper_var) == Some(true) {
+        // Process all new at-least-one packages using drain for better performance
+        let new_packages = std::mem::take(&mut self.new_at_least_one_packages);
+        for (name_id, at_least_one_variable) in new_packages {
+            // Find the at-most-one tracker for the package and process its variables directly
+            if let Some(tracker) = self.state.at_most_one_trackers.get(&name_id) {
+                // Add clauses for the existing variables.
+                for &helper_var in &tracker.variables {
+                    let (watched_literals, kind) =
+                        WatchedLiterals::any_of(at_least_one_variable, helper_var);
+                    let clause_id = self.state.clauses.alloc(watched_literals, kind);
+                    let watched_literals = self.state.clauses.watched_literals[clause_id.to_usize()]
+                        .as_mut()
+                        .expect("forbid clause must have watched literals");
                     self.state
-                        .decision_tracker
-                        .try_add_decision(
-                            Decision::new(at_least_one_variable, true, clause_id),
-                            self.level,
-                        )
-                        .expect("the at least one variable must be undecided");
+                        .watches
+                        .start_watching(watched_literals, clause_id);
+
+                    // Assign true if any of the variables is true.
+                    if self.state.decision_tracker.assigned_value(helper_var) == Some(true) {
+                        self.state
+                            .decision_tracker
+                            .try_add_decision(
+                                Decision::new(at_least_one_variable, true, clause_id),
+                                self.level,
+                            )
+                            .expect("the at least one variable must be undecided");
+                    }
                 }
             }
 
