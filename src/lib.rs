@@ -69,7 +69,8 @@ pub trait Interner {
             .format(" | ");
 
         let name = self.display_solvable_name(solvables[0]);
-        format!("{name} {versions}")
+        let result = format!("{name} {versions}");
+        result.trim_end().to_string()
     }
 
     /// Returns an object that can be used to display the given name in a
